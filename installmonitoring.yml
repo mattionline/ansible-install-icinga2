@@ -1,0 +1,345 @@
+---
+- hosts: localhost
+  connection: local
+  tasks:
+    - name: remove vagrant vm
+      shell: vagrant destroy -f
+
+    - name: start vagrant vm
+      shell: vagrant up
+
+- hosts: vagrant.mattionline.lan
+  tasks:
+    - name: unmount /tmp
+      mount:
+        path: /tmp
+        state: unmounted
+      become: yes
+
+    - name: update pacman
+      pacman:
+        update_cache: yes
+      become: yes
+
+    - name: build packages
+      shell: yaourt -S {{ item }} --export /home/vagrant --noconfirm
+      with_items:
+        - icinga2
+        - icingaweb2
+
+    - name: remove icinga-studio
+      shell: rm -fr /home/vagrant/icinga-studio*
+
+    - name: regex to find version number
+      find:
+        paths: /home/vagrant
+        patterns: "*.pkg.tar.xz"
+      register: packages
+
+    - name: fetch packages
+      fetch:
+        src: "{{ item.path }}"
+        dest: /Users/mathias/ansible/roles/installmonitoring/files/
+        flat: yes
+      with_items:
+        - "{{ packages.files }}"
+
+- hosts: monitoring.mattionline.lan
+  become: yes
+
+  tasks:
+  - name: copy packages onto monitoring
+    copy:
+      src: "/Users/mathias/ansible/roles/installmonitoring/files/{{ item }}"
+      dest: "/tmp/"
+    with_items:
+      - icinga2-common-2.6.3-1-x86_64.pkg.tar.xz
+      - icinga2-2.6.3-1-x86_64.pkg.tar.xz
+      - icingaweb2-2.4.1-1-any.pkg.tar.xz
+
+  - name: install icinga2 / icinga2-common / icingaweb2
+    pacman:
+      name: "/tmp/{{ item }}"
+    with_items:
+      - icinga2-common-2.6.3-1-x86_64.pkg.tar.xz
+      - icinga2-2.6.3-1-x86_64.pkg.tar.xz
+      - icingaweb2-2.4.1-1-any.pkg.tar.xz
+
+  - name: install packages via pacman
+    pacman:
+      name: "{{ item }}"
+      state: present
+    with_items:
+      - grafana
+      - graphite
+      - mariadb
+      - mysql-python
+      - nginx
+      - php-fpm
+      - monitoring-plugins
+
+  - name: enable packages
+    shell: icinga2 feature enable {{ item }}
+    with_items:
+      - graphite
+      - ido-mysql
+      - command
+
+  - name: restart icinga2
+    systemd:
+      name: icinga2
+      state: restarted
+
+  - name: copy nginx.conf
+    copy:
+      src: roles/installmonitoring/files/nginx.conf
+      dest: /etc/nginx/nginx.conf
+
+  - name: copy mysql.schema.sql
+    copy:
+      src: roles/installmonitoring/files/mysql.schema.sql
+      dest: /tmp/mysql.schema.sql
+
+  - name: edit listen address
+    lineinfile:
+      path: /etc/php/php-fpm.d/www.conf
+      regexp: 'listen = /run/php-fpm/php-fpm.sock'
+      line: 'listen = 127.0.0.1:9000'
+
+  - name: edit timezone
+    lineinfile:
+      path: /etc/php/php.ini
+      regexp: ';date.timezone ='
+      line: 'date.timezone = Europe/Berlin'
+
+  - name: activate mysql pdo
+    lineinfile:
+      path: /etc/php/php.ini
+      regexp: ';extension=pdo_mysql.so'
+      line: 'extension=pdo_mysql.so'
+
+  - name: activate gettext
+    lineinfile:
+      path: /etc/php/php.ini
+      regexp: ';extension=gettext.so'
+      line: 'extension=gettext.so'
+
+  - name: restart nginx
+    systemd:
+      name: nginx
+      state: restarted
+
+  - name: restart php-fpm
+    systemd:
+      name: php-fpm
+      state: restarted
+
+  - name: create config directory
+    shell: /usr/share/webapps/icingaweb2/bin/icingacli setup config directory --group icingaweb2;
+
+  - name: check if mysql database exists
+    stat:
+      path: /var/lib/mysql/mysql
+    register: stat_dbexists
+
+  - name: setup database
+    shell: mysql_install_db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+    when: stat_dbexists.stat.exists == False
+
+  - name: restart mariadb
+    shell: systemctl restart mariadb
+
+  - name: check if icingaweb_db database exists
+    stat:
+      path: /var/lib/mysql/icingaweb_db
+    register: stat_icingadbexists
+
+  - name: create database icingaweb_db
+    shell: mysql -u root -e "CREATE DATABASE icingaweb_db;"
+    when: stat_icingadbexists.stat.exists == False
+
+  - name: create user
+    shell: mysql -u root -e "GRANT ALL ON icingaweb_db.* TO icingaweb_db@localhost IDENTIFIED BY 'CHANGEME';"
+    when: stat_icingadbexists.stat.exists == False
+
+  - name: check if icingaweb_db database exists
+    stat:
+      path: /var/lib/mysql/icingaweb_db
+    register: stat_icingaidodbexists
+
+  - name: create database ido
+    shell: mysql -u root -e "CREATE DATABASE icinga_ido;"
+    when: stat_icingaidodbexists.stat.exists == False
+
+  - name: create user
+    shell: mysql -u root -e "GRANT ALL ON icinga_ido.* TO icinga_ido@localhost IDENTIFIED BY 'CHANGEME';"
+    when: stat_icingaidodbexists.stat.exists == False
+
+  - name: import ido scheme
+    shell: mysql -u root icinga_ido < /usr/share/icinga2-ido-mysql/schema/mysql.sql
+    when: stat_icingaidodbexists.stat.exists == False
+
+  - name: import icinga scheme
+    shell: mysql -u root icingaweb_db < /tmp/mysql.schema.sql
+    when: stat_icingadbexists.stat.exists == False
+
+  - name: add user (escaped dollar signs)
+    shell: mysql -u root icingaweb_db -e "INSERT INTO icingaweb_user (name, active, password_hash) VALUES ('icingaadmin', 1, '\$1\$uAFBBtFq\$nhTNsd6AgAKA5GIKaEgll.');"
+    when: stat_icingadbexists.stat.exists == False
+
+  - name: enable monitoring for icingaweb2
+    shell: icingacli module enable monitoring
+
+  - name: set permissions of module folder
+    file:
+      path: /etc/icingaweb2/enabledModules/
+      mode: 770
+
+  - name: copy files to icingaweb2
+    copy:
+      src: "/Users/mathias/ansible/roles/installmonitoring/files/{{ item }}"
+      dest: "/etc/icingaweb2/"
+    with_items:
+      - authentication.ini
+      - config.ini
+      - resources.ini
+      - roles.ini
+
+  - name: create module folder
+    file:
+      path: /etc/icingaweb2/modules/monitoring
+      state: directory
+
+  - name: copy module files to icingaweb2
+    copy:
+      src: "/Users/mathias/ansible/roles/installmonitoring/files/modules/{{ item }}"
+      dest: "/etc/icingaweb2/modules/monitoring/"
+    with_items:
+      - config.ini
+      - commandtransports.ini
+      - backends.ini
+
+  - name: copy mysql-ido file to icinga2
+    copy:
+      src: roles/installmonitoring/files/ido-mysql.conf
+      dest: /etc/icinga2/features-available/
+
+  - name: check if icinga2 crt file exists
+    stat:
+      path: "/etc/icinga2/pki/{{ inventory_hostname }}.crt"
+    register: stat_crtfile
+
+  - name: create master setup
+    shell: icinga2 node setup --master
+    when: stat_crtfile.stat.exists == False
+
+- hosts: arch-servers
+  become: yes
+
+  tasks:
+    - name: copy icinga2 packages
+      copy:
+        src: "/Users/mathias/ansible/roles/installmonitoring/files/{{ item }}"
+        dest: "/tmp/"
+      with_items:
+        - icinga2-common-2.6.3-1-x86_64.pkg.tar.xz
+        - icinga2-2.6.3-1-x86_64.pkg.tar.xz
+      when: inventory_hostname != "monitoring.mattionline.lan"
+
+    - name: install icinga2
+      pacman:
+        name: "/tmp/{{ item }}"
+      with_items:
+        - icinga2-common-2.6.3-1-x86_64.pkg.tar.xz
+        - icinga2-2.6.3-1-x86_64.pkg.tar.xz
+      when: inventory_hostname != "monitoring.mattionline.lan"
+
+    - name: check if icinga2 key file exists
+      stat:
+        path: "/etc/icinga2/pki/{{ inventory_hostname }}.key"
+      register: stat_keyfile
+
+    - name: check if icinga2 crt file exists
+      stat:
+        path: "/etc/icinga2/pki/{{ inventory_hostname }}.crt"
+      register: stat_crtfile
+
+    - name: create client certificates
+      shell: "icinga2 pki new-cert --cn {{ inventory_hostname }} --key /etc/icinga2/pki/{{ inventory_hostname }}.key --cert /etc/icinga2/pki/{{ inventory_hostname }}.crt"
+      when:
+        - inventory_hostname != "monitoring.mattionline.lan"
+        - stat_keyfile.stat.exists == False
+        - stat_crtfile.stat.exists == False
+
+    - name: check if monitoring certificate exists
+      stat:
+        path: /etc/icinga2/pki/monitoring.mattionline.lan.crt
+      register: stat_monitoringfile
+
+    - name: get master certificates
+      shell: "icinga2 pki save-cert --key /etc/icinga2/pki/{{ inventory_hostname }}.key --cert /etc/icinga2/pki/{{ inventory_hostname }}.crt --trustedcert /etc/icinga2/pki/monitoring.mattionline.lan.crt --host monitoring.mattionline.lan"
+      when:
+        - inventory_hostname != "monitoring.mattionline.lan"
+        - stat_monitoringfile.stat.exists == False
+
+    - name: generate pki ticket for nodes
+      shell: "icinga2 pki ticket --cn {{ inventory_hostname }}"
+      register: ticketpass
+      delegate_to: monitoring.mattionline.lan
+      when: inventory_hostname != "monitoring.mattionline.lan"
+
+    - name: setup satellite
+      shell: "icinga2 node setup --ticket {{ ticketpass.stdout }} --cn {{ inventory_hostname }} --endpoint monitoring.mattionline.lan --zone {{ inventory_hostname }} --master_host monitoring.mattionline.lan --trustedcert /etc/icinga2/pki/monitoring.mattionline.lan.crt --accept-commands --accept-config"
+      when: inventory_hostname != "monitoring.mattionline.lan"
+
+    - name: add endpoint in zones.conf
+      lineinfile:
+        path: /etc/icinga2/zones.conf
+        line: "object Endpoint \"{{ inventory_hostname }}\" { }"
+      when: inventory_hostname != "monitoring.mattionline.lan"
+      delegate_to: monitoring.mattionline.lan
+
+    - name: add zone in zones.conf
+      lineinfile:
+        path: /etc/icinga2/zones.conf
+        line: "object Zone \"{{ inventory_hostname }}\" { endpoints = [ \"{{ inventory_hostname }}\" ]; parent = ZoneName }"
+      when: inventory_hostname != "monitoring.mattionline.lan"
+      delegate_to: monitoring.mattionline.lan
+
+    - name: restart icinga2 on master
+      systemd:
+        name: icinga2
+        state: restarted
+      when: inventory_hostname == "monitoring.mattionline.lan"
+
+    - name: restart icinga2 on nodes
+      systemd:
+        name: icinga2
+        state: restarted
+      when: inventory_hostname != "monitoring.mattionline.lan"
+
+    - template:
+        src: roles/installmonitoring/templates/host.conf
+        dest: "/etc/icinga2/zones.d/{{ inventory_hostname }}.conf"
+        owner: root
+        group: root
+        mode: 0644
+      delegate_to: monitoring.mattionline.lan
+
+    - name: copy templates conf
+      copy:
+        remote_src: true
+        src: /etc/icinga2/conf.d.example/templates.conf
+        dest: /etc/icinga2/conf.d/templates.conf
+      when: inventory_hostname == "monitoring.mattionline.lan"
+
+    - name: restart icinga2 on master
+      systemd:
+        name: icinga2
+        state: restarted
+      when: inventory_hostname == "monitoring.mattionline.lan"
+
+    - name: install grafana / graphite
+      pacman:
+        name: monitoring-plugins
+        state: present
