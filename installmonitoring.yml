@@ -339,7 +339,7 @@
         state: restarted
       when: inventory_hostname == "monitoring.mattionline.lan"
 
-    - name: install grafana / graphite
+    - name: install monitoring plugins
       pacman:
         name: monitoring-plugins
         state: present
