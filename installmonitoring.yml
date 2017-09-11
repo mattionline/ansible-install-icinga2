@@ -47,6 +47,9 @@
 - hosts: monitoring.mattionline.lan
   become: yes
 
+  vars_files:
+    - group_vars/global.yml
+
   tasks:
   - name: copy packages onto monitoring
     copy:
@@ -81,7 +84,6 @@
   - name: enable packages
     shell: icinga2 feature enable {{ item }}
     with_items:
-      - graphite
       - ido-mysql
       - command
 
@@ -193,7 +195,7 @@
   - name: set permissions of module folder
     file:
       path: /etc/icingaweb2/enabledModules/
-      mode: 770
+      mode: 0770
 
   - name: copy files to icingaweb2
     copy:
@@ -236,6 +238,9 @@
 - hosts: arch-servers
   become: yes
 
+  vars_files:
+    - group_vars/global.yml
+
   tasks:
     - name: copy icinga2 packages
       copy:
@@ -276,6 +281,9 @@
         path: /etc/icinga2/pki/monitoring.mattionline.lan.crt
       register: stat_monitoringfile
 
+    - name: enable feature notification
+      shell: icinga2 feature enable notification
+
     - name: get master certificates
       shell: "icinga2 pki save-cert --key /etc/icinga2/pki/{{ inventory_hostname }}.key --cert /etc/icinga2/pki/{{ inventory_hostname }}.crt --trustedcert /etc/icinga2/pki/monitoring.mattionline.lan.crt --host monitoring.mattionline.lan"
       when:
@@ -292,6 +300,13 @@
       shell: "icinga2 node setup --ticket {{ ticketpass.stdout }} --cn {{ inventory_hostname }} --endpoint monitoring.mattionline.lan --zone {{ inventory_hostname }} --master_host monitoring.mattionline.lan --trustedcert /etc/icinga2/pki/monitoring.mattionline.lan.crt --accept-commands --accept-config"
       when: inventory_hostname != "monitoring.mattionline.lan"
 
+    - name: manually add ticketpass
+      replace:
+        path: /etc/icinga2/constants.conf
+        regexp: "const TicketSalt = \"\""
+        replace: "const TicketSalt = \"{{ ticketpass.stdout }}\""
+      when: inventory_hostname != "monitoring.mattionline.lan"
+
     - name: add endpoint in zones.conf
       lineinfile:
         path: /etc/icinga2/zones.conf
@@ -306,11 +321,23 @@
       when: inventory_hostname != "monitoring.mattionline.lan"
       delegate_to: monitoring.mattionline.lan
 
+    - name: add api user
+      lineinfile:
+        path: /etc/icinga2/zones.d/monitoring.mattionline.lan/api-users.conf
+        line: "object ApiUser \"api\" { password = \"api\"; permissions = [ \"*\" ] }"
+      when: inventory_hostname == "monitoring.mattionline.lan"
+
     - name: restart icinga2 on master
       systemd:
         name: icinga2
         state: restarted
       when: inventory_hostname == "monitoring.mattionline.lan"
+
+    - name: set correct endpoints
+      copy:
+        src: roles/installmonitoring/files/zones.conf
+        dest: /etc/icinga2/zones.conf
+      when: inventory_hostname != "monitoring.mattionline.lan"
 
     - name: restart icinga2 on nodes
       systemd:
@@ -318,9 +345,10 @@
         state: restarted
       when: inventory_hostname != "monitoring.mattionline.lan"
 
-    - template:
+    - name: add hosts on icinga2 master
+      template:
         src: roles/installmonitoring/templates/host.conf
-        dest: "/etc/icinga2/zones.d/{{ inventory_hostname }}.conf"
+        dest: "/etc/icinga2/zones.d/monitoring.mattionline.lan/hosts/{{ inventory_hostname }}.conf"
         owner: root
         group: root
         mode: 0644
@@ -330,7 +358,20 @@
       copy:
         remote_src: true
         src: /etc/icinga2/conf.d.example/templates.conf
-        dest: /etc/icinga2/conf.d/templates.conf
+        dest: /etc/icinga2/zones.d/monitoring.mattionline.lan/templates.conf
+      when: inventory_hostname == "monitoring.mattionline.lan"
+
+    - name: add global templates
+      lineinfile:
+        path: /etc/icinga2/zones.conf
+        line: "object Zone \"global-templates\" { global = true }"
+      when: inventory_hostname == "monitoring.mattionline.lan"
+
+    - name: add folder global templates
+      file:
+        path: /etc/icinga2/zones.d/global-templates
+        state: directory
+        mode: 0755
       when: inventory_hostname == "monitoring.mattionline.lan"
 
     - name: restart icinga2 on master
@@ -339,7 +380,7 @@
         state: restarted
       when: inventory_hostname == "monitoring.mattionline.lan"
 
-    - name: install monitoring plugins
+    - name: install monitoring-plugins
       pacman:
         name: monitoring-plugins
         state: present
